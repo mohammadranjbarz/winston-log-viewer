@@ -8,9 +8,10 @@
 ```
 
 ### Usage
-`npm i -g winston-log-viewer` and then `tail -f logFile.log | winston-log-viewer`
-or you can use it without installing
-`tail -f logFile.log | npx winston-log-viewer`
+* `npm i -g winston-log-viewer`
+* `tail -f logFile.log | winston-log-viewer`
+Or
+* `tail -f logFile.log | npx winston-log-viewer`
 
 PS: if you want to test package locally after clone you can run this command `tail -f winston-sample.log | ./bin/winston-log-viewer`
 Manifesto: Server logs should be structured. JSON's a good format. Let's do
