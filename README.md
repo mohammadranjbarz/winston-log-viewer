@@ -15,6 +15,11 @@ Or
 
 * `tail -f logFile.log | npx winston-log-viewer`
 
+![Screen Shot 1400-04-29 at 17 22 30](https://user-images.githubusercontent.com/9850545/126327995-a5dbf992-0a43-4a18-80c8-a0275d2f1efb.png)
+
+
+
+
 PS: if you want to test package locally after clone you can run this command `tail -f winston-sample.log | ./bin/winston-log-viewer`
 Manifesto: Server logs should be structured. JSON's a good format. Let's do
 that. A log record is one line of `JSON.stringify`'d output. Let's also
