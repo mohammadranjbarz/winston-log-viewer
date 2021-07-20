@@ -1,0 +1,4 @@
+{"level":"info","message":"Trying to create user","params":[{"name":"mohammad"}],"timestamp":"2021-07-19T13:30:44.185Z"}
+{"level":"debug","message":"It's better to user have age","timestamp":"2021-07-19T13:30:44.185Z"}
+{"level":"error","message":"user's name should be unique","params":[{"name":"mohammad"}],"timestamp":"2021-07-19T13:32:22.286Z"}
+

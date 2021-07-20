@@ -1,0 +1,34 @@
+{
+  "name": "winston-log-viewer",
+  "version": "0.1.0",
+  "description": "A package to show winston log files beautifully",
+  "author": "Mohammad Ranjbar Z <mranjbar.z2993@gmail.com",
+  "bin": {
+    "winston-log-viewer": "./bin/winston-log-viewer"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/mohammadranjbarz/winston-log-viewer.git"
+  },
+  "engines": [
+    "node >=6.0.0"
+  ],
+  "keywords": [
+    "log",
+    "logging",
+    "log4j",
+    "json",
+    "bunyan",
+    "winston"
+  ],
+  "license": "MIT",
+  "files": [
+    "bin"
+  ],
+  "scripts": {
+    "check": "echo 'should add eslint'"
+  },
+  "dependencies": {
+    "exeunt": "1.1.0"
+  }
+}

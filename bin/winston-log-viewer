@@ -1,0 +1,547 @@
+#!/usr/bin/env node
+/**
+ * Copyright 2020 Trent Mick
+ * Copyright 2020 Joyent Inc.
+ *
+ * bunyan -- filter and pretty-print Winston-log-viewer log files (line-delimited JSON)
+ *
+ * See <https://github.com/trentm/node-bunyan>.
+ *
+ * -*- mode: js -*-
+ * vim: expandtab:ts=4:sw=4
+ */
+
+const util = require('util');
+const warn = console.warn;
+
+const exeunt = require('exeunt');
+
+// Levels
+const TRACE = 'trace';
+const DEBUG = 'debug';
+const INFO = 'info';
+const WARN = 'warn';
+const ERROR = 'error';
+const FATAL = 'fatal';
+
+const levelFromName = {
+  'trace': TRACE,
+  'debug': DEBUG,
+  'info': INFO,
+  'warn': WARN,
+  'error': ERROR,
+  'fatal': FATAL
+};
+const nameFromLevel = {};
+const upperNameFromLevel = {};
+const upperPaddedNameFromLevel = {};
+Object.keys(levelFromName).forEach(function (name) {
+  const lvl = levelFromName[name];
+  nameFromLevel[lvl] = name;
+  upperNameFromLevel[lvl] = name.toUpperCase();
+  upperPaddedNameFromLevel[lvl] = (
+    name.length === 4 ? ' ' : '') + name.toUpperCase();
+});
+
+
+// Boolean set to true when we are in the process of exiting. We don't always
+// hard-exit (e.g. when staying alive while the pager completes).
+let exiting = false;
+
+// The current raw input line being processed. Used for `uncaughtException`.
+let currLine = null;
+
+// Child dtrace process, if any. Used for signal-handling.
+let child = null;
+
+// Whether ANSI codes are being used. Used for signal-handling.
+let usingAnsiCodes = false;
+
+// Used to tell the 'uncaughtException' handler that '-c CODE' is being used.
+const gUsingConditionOpts = false;
+
+// Pager child process, and output stream to which to write.
+let pager = null;
+let stdout = process.stdout;
+
+
+
+//---- support functions
+
+let _version = null;
+function getVersion() {
+  if (_version === null) {
+    _version = require('../package.json').version;
+  }
+  return _version;
+}
+
+
+const format = util.format;
+
+function indent(s) {
+  return '    ' + s.split(/\r?\n/).join('\n    ');
+}
+
+const streams = {};
+
+function gotRecord(file, line, rec, opts, stylize)
+{
+  const time = new Date(rec.timestamp);
+
+  streams[file]['records'].push({ line: line, rec: rec, time: time });
+  emitNextRecord(opts, stylize);
+}
+
+function emitNextRecord(opts, stylize)
+{
+  let ofile, ready, minfile, rec;
+
+  for (;;) {
+    /*
+     * Take a first pass through the input streams to see if we have a
+     * record from all of them.  If not, we'll pause any streams for
+     * which we do already have a record (to avoid consuming excess
+     * memory) and then wait until we have records from the others
+     * before emitting the next record.
+     *
+     * As part of the same pass, we look for the earliest record
+     * we have not yet emitted.
+     */
+    minfile = undefined;
+    ready = true;
+    for (ofile in streams) {
+
+      if (streams[ofile].stream === null ||
+        (!streams[ofile].done && streams[ofile].records.length === 0)) {
+        ready = false;
+        break;
+      }
+
+      if (streams[ofile].records.length > 0 &&
+        (minfile === undefined ||
+          streams[minfile].records[0].timestamp >
+          streams[ofile].records[0].timestamp)) {
+        minfile = ofile;
+      }
+    }
+
+    if (!ready || minfile === undefined) {
+      for (ofile in streams) {
+        if (!streams[ofile].stream || streams[ofile].done)
+          continue;
+
+        if (streams[ofile].records.length > 0) {
+          if (!streams[ofile].paused) {
+            streams[ofile].paused = true;
+            streams[ofile].stream.pause();
+          }
+        } else if (streams[ofile].paused) {
+          streams[ofile].paused = false;
+          streams[ofile].stream.resume();
+        }
+      }
+
+      return;
+    }
+
+    /*
+     * Emit the next record for 'minfile', and invoke ourselves again to
+     * make sure we emit as many records as we can right now.
+     */
+    rec = streams[minfile].records.shift();
+    emitRecord(rec.rec, rec.line, opts, stylize);
+  }
+}
+
+
+// http://en.wikipedia.org/wiki/ANSI_escape_code#graphics
+// Suggested colors (some are unreadable in common cases):
+// - Good: cyan, yellow (limited use), bold, green, magenta, red
+// - Bad: blue (not visible on cmd.exe), grey (same color as background on
+//   Solarized Dark theme from <https://github.com/altercation/solarized>, see
+//   issue #160)
+const colors = {
+  'bold' : [1, 22],
+  'italic' : [3, 23],
+  'underline' : [4, 24],
+  'inverse' : [7, 27],
+  'white' : [37, 39],
+  'grey' : [90, 39],
+  'black' : [30, 39],
+  'blue' : [34, 39],
+  'cyan' : [36, 39],
+  'green' : [32, 39],
+  'magenta' : [35, 39],
+  'red' : [31, 39],
+  'yellow' : [33, 39]
+};
+
+function stylizeWithColor(str, color) {
+  if (!str)
+    return '';
+  const codes = colors[color];
+  if (codes) {
+    return '\033[' + codes[0] + 'm' + str +
+      '\033[' + codes[1] + 'm';
+  } else {
+    return str;
+  }
+}
+
+function stylizeWithoutColor(str, color) {
+  return str;
+}
+
+
+/**
+ * Is this a valid Winston log record.
+ */
+function isValidRecord(rec) {
+  if (rec.message == null ||
+    rec.level == null ||
+    rec.timestamp == null ) {
+    // Not valid Winston log.
+    return false;
+  } else {
+    return true;
+  }
+}
+
+
+/**
+ * Parses the given log line and either emits it right away (for invalid
+ * records) or enqueues it for emitting later when it's the next line to show.
+ */
+function handleLogLine(file, line, opts, stylize) {
+  if (exiting) {
+    return;
+  }
+
+  currLine = line; // intentionally global
+
+  // Emit non-JSON lines immediately.
+  let rec;
+  if (!line) {
+    if (!opts.strict) emit(line + '\n');
+    return;
+  } else if (line[0] !== '{') {
+    if (!opts.strict) emit(line + '\n');  // not JSON
+    return;
+  } else {
+    try {
+      rec = JSON.parse(line);
+    } catch (e) {
+      if (!opts.strict) emit(line + '\n');
+      return;
+    }
+  }
+
+  if (!isValidRecord(rec)) {
+    if (!opts.strict) emit(line + '\n');
+    return;
+  }
+
+  if (file === null)
+    return emitRecord(rec, line, opts, stylize);
+
+  return gotRecord(file, line, rec, opts, stylize);
+}
+
+/**
+ * Print out a single result, considering input options.
+ */
+function emitRecord(rec, line, opts, stylize) {
+  const short =false;
+  if (!isValidRecord(rec)) {
+    return emit(line + '\n');
+  }
+  const time = stylize('[' + rec.timestamp + ']', 'none');
+  delete rec.timestamp;
+
+  let level = (upperPaddedNameFromLevel[rec.level] || 'LVL' + rec.level);
+  if (opts.color) {
+    const colorFromLevel = {
+      trace: 'white',    // TRACE
+      debug: 'yellow',   // DEBUG
+      info: 'cyan',     // INFO
+      warn: 'magenta',  // WARN
+      error: 'red',      // ERROR
+      fatal: 'inverse',  // FATAL
+    };
+    level = stylize(level, colorFromLevel[rec.level]);
+  }
+  delete rec.level;
+
+  let extras = [];
+  let details = [];
+
+  if (rec.req_id) {
+    extras.push('req_id=' + rec.req_id);
+  }
+  delete rec.req_id;
+
+  let onelineMsg;
+  if (rec.message.indexOf('\n') !== -1) {
+    onelineMsg = '';
+    details.push(indent(stylize(rec.message, 'cyan')));
+  } else {
+    onelineMsg = ' ' + stylize(rec.message, 'cyan');
+  }
+  delete rec.message;
+
+
+  if (rec.params && rec.params.length >0) {
+    rec.params.forEach(param =>{
+      const paramsStr = typeof param === 'object'? JSON.stringify(param, null, opts.jsonIndent):param
+      details.push(indent(stylize(paramsStr, 'cyan')));
+    })
+  }
+  delete rec.params
+
+  //TODO should test it
+  if (rec.err && rec.err.stack) {
+    const err = rec.err
+    if (typeof (err.stack) !== 'string') {
+      details.push(indent(err.stack.toString()));
+    } else {
+      details.push(indent(err.stack));
+    }
+    delete err.message;
+    delete err.name;
+    delete err.stack;
+    // E.g. for extra 'foo' field on 'err', add 'err.foo' at
+    // top-level. This *does* have the potential to stomp on a
+    // literal 'err.foo' key.
+    Object.keys(err).forEach(function (k) {
+      rec['err.' + k] = err[k];
+    })
+    delete rec.err;
+  }
+
+  const leftover = Object.keys(rec);
+  for (let i = 0; i < leftover.length; i++) {
+    const key = leftover[i];
+    let value = rec[key];
+    let stringified = false;
+    if (typeof (value) !== 'string') {
+      value = JSON.stringify(value, null, 2);
+      stringified = true;
+    }
+    if (value.indexOf('\n') !== -1 || value.length > 50) {
+      details.push(indent(key + ': ' + value));
+    } else if (!stringified && (value.indexOf(' ') != -1 ||
+      value.length === 0))
+    {
+      extras.push(key + '=' + JSON.stringify(value));
+    } else {
+      extras.push(key + '=' + value);
+    }
+  }
+
+  extras = stylize(
+    (extras.length ? ' (' + extras.join(', ') + ')' : ''), 'none');
+  details = stylize(
+    (details.length ? details.join('\n    --\n') + '\n' : ''), 'none');
+  if (!short)
+    emit(format('%s %s: %s%s\n%s',
+      time,
+      level,
+      onelineMsg,
+      extras,
+      details));
+  else
+    emit(format('%s %s :%s%s\n%s',
+      time,
+      level,
+      onelineMsg,
+      extras,
+      details));
+
+}
+
+
+function emit(s) {
+  try {
+    stdout.write(s);
+  } catch (writeErr) {
+    // Handle any exceptions in stdout writing in `stdout.on('error', ...)`.
+  }
+}
+
+
+/**
+ * Process all input from stdin.
+ *
+ * @params opts {Object} Winston-log-viewer options object.
+ * @param stylize {Function} Output stylize function to use.
+ * @param callback {Function} `function ()`
+ */
+function processStdin(opts, stylize, callback) {
+  let leftover = '';  // Left-over partial line from last chunk.
+  const stdin = process.stdin;
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  stdin.on('data', function (chunk) {
+    const lines = chunk.split(/\r\n|\n/);
+    let length = lines.length;
+    if (length === 1) {
+      leftover += lines[0];
+      return;
+    }
+
+    if (length > 1) {
+      handleLogLine(null, leftover + lines[0], opts, stylize);
+    }
+    leftover = lines.pop();
+    length -= 1;
+    for (let i = 1; i < length; i++) {
+      handleLogLine(null, lines[i], opts, stylize);
+    }
+  });
+  stdin.on('end', function () {
+    if (leftover) {
+      handleLogLine(null, leftover, opts, stylize);
+      leftover = '';
+    }
+    callback();
+  });
+}
+
+/**
+ * Cleanup and exit properly.
+ *
+ * Warning: this doesn't necessarily stop processing, i.e. process exit
+ * might be delayed. It is up to the caller to ensure that no subsequent
+ * bunyan processing is done after calling this.
+ *
+ * @param code {Number} exit code.
+ * @param signal {String} Optional signal name, if this was exitting because
+ *    of a signal.
+ */
+function cleanupAndExit(code, signal) {
+  // Guard one call.
+  if (exiting) {
+    return;
+  }
+  exiting = true;
+
+  // Clear possibly interrupted ANSI code (issue #59).
+  if (usingAnsiCodes) {
+    stdout.write('\033[0m');
+  }
+
+  // Kill possible dtrace child.
+  if (child) {
+    child.kill(signal);
+  }
+
+  if (pager) {
+    // Let pager know that output is done, then wait for pager to exit.
+    pager.removeListener('exit', onPrematurePagerExit);
+    pager.on('exit', function onPagerExit(pagerCode) {
+      process.exit(pagerCode || code);
+    });
+    stdout.end();
+  } else if (code) {
+    // Non-zero exit: Something is wrong. We are very likely still
+    // processing log records -- i.e. we have open handles -- so we need
+    // a hard stop (aka `process.exit`).
+    process.exit(code);
+  } else {
+    // Zero exit: This should be a "normal" exit, for which we want to
+    // flush stdout/stderr.
+    exeunt.softExit(code);
+  }
+}
+
+
+
+//---- mainline
+
+process.on('SIGINT', function () { cleanupAndExit(1, 'SIGINT'); });
+process.on('SIGQUIT', function () { cleanupAndExit(1, 'SIGQUIT'); });
+process.on('SIGTERM', function () { cleanupAndExit(1, 'SIGTERM'); });
+process.on('SIGHUP', function () { cleanupAndExit(1, 'SIGHUP'); });
+
+process.on('uncaughtException', function (err) {
+  function _indent(s) {
+    const lines = s.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      lines[i] = '*     ' + lines[i];
+    }
+    return lines.join('\n');
+  }
+
+  const title = encodeURIComponent(format(
+    'Winston-log-viewer %s crashed: %s', getVersion(), String(err)));
+  const e = console.error;
+  e('```');
+  e('* The Winston-log-viewer CLI crashed!');
+  e('*');
+  if (err.name === 'ReferenceError' && gUsingConditionOpts) {
+    /* BEGIN JSSTYLED */
+    e('* This crash was due to a "ReferenceError", which is often the result of given');
+    e('* `-c CONDITION` code that doesn\'t guard against undefined values. If that is');
+    /* END JSSTYLED */
+    e('* not the problem:');
+    e('*');
+  }
+  e('* Please report this issue and include the details below:');
+  e('*');
+  e('*    https://github.com/trentm/node-bunyan/issues/new?title=%s', title);
+  e('*');
+  e('* * *');
+  e('* platform:', process.platform);
+  e('* node version:', process.version);
+  e('* bunyan version:', getVersion());
+  e('* argv: %j', process.argv);
+  e('* log line: %j', currLine);
+  e('* stack:');
+  e(_indent(err.stack));
+  e('```');
+  process.exit(1);
+});
+
+
+// Early termination of the pager: just stop.
+function onPrematurePagerExit(pagerCode) {
+  // 'pager' and 'stdout' are intentionally global.
+  pager = null;
+  stdout.end()
+  stdout = process.stdout;
+  cleanupAndExit(pagerCode);
+}
+
+
+function main() {
+  const opts =  {
+    args: [],
+    color: process.stdout.isTTY,
+    jsonIndent: 2,
+  };
+  usingAnsiCodes = opts.color; // intentionally global
+  const stylize = (opts.color ? stylizeWithColor : stylizeWithoutColor);
+
+
+  // Stdout error handling. (Couldn't setup until `stdout` was determined.)
+  stdout.on('error', function (err) {
+    if (exiting) {
+      return;
+    } else if (err.code === 'EPIPE') {
+      cleanupAndExit(0);
+    } else {
+      warn('bunyan: error on output stream: %s', err);
+      cleanupAndExit(1);
+    }
+  });
+
+  const retval = 0;
+  processStdin(opts, stylize, function () {
+    cleanupAndExit(retval);
+  });
+}
+
+if (require.main === module) {
+  main(process.argv);
+}
