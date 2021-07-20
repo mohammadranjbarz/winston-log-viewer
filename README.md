@@ -10,7 +10,9 @@
 ### Usage
 * `npm i -g winston-log-viewer`
 * `tail -f logFile.log | winston-log-viewer`
+
 Or
+
 * `tail -f logFile.log | npx winston-log-viewer`
 
 PS: if you want to test package locally after clone you can run this command `tail -f winston-sample.log | ./bin/winston-log-viewer`
