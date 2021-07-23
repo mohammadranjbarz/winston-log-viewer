@@ -1,6 +1,5 @@
-[![npm version](https://img.shields.io/npm/v/winston-log-viewer.svg?style=flat)](https://www.npmjs.com/package/winston-log-viewer)
-
-**Winston-log-viewer** is npm CLI package for pretty printing winston log files, the file log should be in this format:
+### Winston-log-viewer
+is a npm CLI package for pretty printing winston log files, the file log should be in this format:
 ```
 {"level":"info","Trying to create user","params":[{"name":"mohammad"}],"timestamp":"2021-07-19T13:30:44.185Z"}
 {"level":"debug","It's better to user have age","timestamp":"2021-07-19T13:30:44.185Z"}
